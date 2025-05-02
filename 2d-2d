@@ -1,0 +1,171 @@
+#include <mpi.h>
+#include <iostream>
+#include <vector>
+#include <cmath>
+#include <iomanip>
+
+const int Nx = 4096;
+const int Ny = 4096;
+const double h = 0.1;
+const double alpha = 1.0;
+const double dt = 0.0025;
+const double T = 0.1;
+const int Nt = static_cast<int>(T / dt);
+const double PI = 3.141592653589793;
+
+double initialCondition(double x, double y) {
+    return alpha * (1 - x) * y * (1 - y);
+}
+
+double analyticalSolution(double x, double y, double t) {
+    double sum = 0.0;
+    for (int m = 1; m <= 9; m += 2) {
+        for (int n = 1; n <= 9; n += 2) {
+            double Amn = 64.0 / (pow(PI * m * n, 3));
+            double term = Amn *
+                sin(m * PI * x) *
+                sin(n * PI * y) *
+                exp(-alpha * PI * PI * (m * m + n * n) * t);
+            sum += term;
+        }
+    }
+    return sum;
+}
+
+void printGrid(const std::vector<std::vector<double>>& grid, const std::string& title) {
+    std::cout << "\n" << title << ":\n\n";
+    std::cout << std::setw(10) << "y\\x";
+    for (int j = 0; j <= Ny; ++j) {
+        std::cout << std::setw(12) << std::fixed << std::setprecision(1) << j * h;
+    }
+    std::cout << "\n";
+
+    int rowsToPrint = std::min(5, Nx + 1);
+    for (int i = 0; i < rowsToPrint; ++i) {
+        std::cout << std::setw(10) << std::fixed << std::setprecision(1) << i * h;
+        for (int j = 0; j <= Ny; ++j) {
+            std::cout << std::setw(12) << std::fixed << std::setprecision(5) << grid[i][j];
+        }
+        std::cout << "\n";
+    }
+}
+
+int main(int argc, char* argv[]) {
+    MPI_Init(&argc, &argv);
+
+    int rank, size;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+
+    int sqrt_size = std::sqrt(size);
+    if (sqrt_size * sqrt_size != size) {
+        std::cerr << "Size must be a perfect square for 2D decomposition!" << std::endl;
+        MPI_Finalize();
+        return 1;
+    }
+
+    int rowsPerProc = Nx / sqrt_size;
+    int colsPerProc = Ny / sqrt_size;
+
+    int rowRank = rank / sqrt_size;
+    int colRank = rank % sqrt_size;
+
+    int startX = rowRank * rowsPerProc + 1;
+    int endX = (rowRank == sqrt_size - 1) ? Nx - 1 : (rowRank + 1) * rowsPerProc;
+
+    int startY = colRank * colsPerProc + 1;
+    int endY = (colRank == sqrt_size - 1) ? Ny - 1 : (colRank + 1) * colsPerProc;
+
+    std::vector<std::vector<double>> U_local(rowsPerProc + 2, std::vector<double>(colsPerProc + 2, 0.0));
+    std::vector<std::vector<double>> U_new_local = U_local;
+
+    for (int i = 1; i <= rowsPerProc; ++i) {
+        for (int j = 1; j <= colsPerProc; ++j) {
+            double x = (startX + i - 1) * h;
+            double y = (startY + j - 1) * h;
+            U_local[i][j] = initialCondition(x, y);
+        }
+    }
+
+    double coeff = alpha * dt / (h * h);
+
+    double startTime = MPI_Wtime();
+
+    for (int t = 0; t < Nt; ++t) {
+        for (int i = 1; i <= rowsPerProc; ++i) {
+            for (int j = 1; j <= colsPerProc; ++j) {
+                U_new_local[i][j] = U_local[i][j] + coeff * (
+                    U_local[i + 1][j] + U_local[i - 1][j] + U_local[i][j + 1] + U_local[i][j - 1] - 4 * U_local[i][j]
+                );
+            }
+        }
+
+        if (rowRank > 0) {
+            MPI_Sendrecv(&U_local[1][1], colsPerProc, MPI_DOUBLE, rank - sqrt_size, 0,
+                         &U_local[0][1], colsPerProc, MPI_DOUBLE, rank - sqrt_size, 0,
+                         MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        }
+        if (rowRank < sqrt_size - 1) {
+            MPI_Sendrecv(&U_local[rowsPerProc][1], colsPerProc, MPI_DOUBLE, rank + sqrt_size, 0,
+                         &U_local[rowsPerProc + 1][1], colsPerProc, MPI_DOUBLE, rank + sqrt_size, 0,
+                         MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        }
+        if (colRank > 0) {
+            MPI_Sendrecv(&U_local[1][1], rowsPerProc, MPI_DOUBLE, rank - 1, 0,
+                         &U_local[1][0], rowsPerProc, MPI_DOUBLE, rank - 1, 0,
+                         MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        }
+        if (colRank < sqrt_size - 1) {
+            MPI_Sendrecv(&U_local[1][colsPerProc], rowsPerProc, MPI_DOUBLE, rank + 1, 0,
+                         &U_local[1][colsPerProc + 1], rowsPerProc, MPI_DOUBLE, rank + 1, 0,
+                         MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        }
+
+        U_local.swap(U_new_local);
+    }
+
+    double endTime = MPI_Wtime();
+    double timeTaken = endTime - startTime;
+
+    double totalTime;
+    MPI_Reduce(&timeTaken, &totalTime, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+
+    if (rank == 0) {
+        std::cout << "Total computation time: " << totalTime << " seconds" << std::endl;
+
+        std::vector<std::vector<double>> final_U(Nx + 1, std::vector<double>(Ny + 1));
+        for (int proc = 1; proc < size; ++proc) {
+            int procRow = proc / sqrt_size;
+            int procCol = proc % sqrt_size;
+            int procStartX = procRow * rowsPerProc + 1;
+            int procEndX = (procRow == sqrt_size - 1) ? Nx - 1 : (procRow + 1) * rowsPerProc;
+
+            int procStartY = procCol * colsPerProc + 1;
+            int procEndY = (procCol == sqrt_size - 1) ? Ny - 1 : (procCol + 1) * colsPerProc;
+
+            for (int i = procStartX; i <= procEndX; ++i) {
+                MPI_Recv(&final_U[i][procStartY], procEndY - procStartY + 1, MPI_DOUBLE, proc, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            }
+        }
+
+        std::vector<std::vector<double>> U_analytical(Nx + 1, std::vector<double>(Ny + 1));
+        std::vector<std::vector<double>> U_error(Nx + 1, std::vector<double>(Ny + 1));
+
+        for (int i = 0; i <= Nx; ++i) {
+            for (int j = 0; j <= Ny; ++j) {
+                double x = i * h;
+                double y = j * h;
+                U_analytical[i][j] = analyticalSolution(x, y, T);
+                U_error[i][j] = std::fabs(final_U[i][j] - U_analytical[i][j]);
+            }
+        }
+
+        printGrid(final_U, "Numerical Solution");
+        printGrid(U_analytical, "Analytical Solution");
+        printGrid(U_error, "Error");
+    }
+
+    MPI_Finalize();
+
+    return 0;
+}
