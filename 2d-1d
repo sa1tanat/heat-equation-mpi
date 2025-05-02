@@ -1,0 +1,174 @@
+#include <mpi.h>
+#include <iostream>
+#include <vector>
+#include <cmath>
+#include <iomanip>
+#include <algorithm>
+
+const int Nx = 4096;
+const int Ny = 4096;
+const double h = 0.1;
+const double alpha = 1.0;
+const double dt = 0.0025;
+const double T = 0.1;
+const int Nt = static_cast<int>(T / dt);
+const double PI = 3.141592653589793;
+
+double initialCondition(double x, double y) {
+    return alpha * (1 - x) * y * (1 - y);
+}
+
+double analyticalSolution(double x, double y, double t) {
+    double sum = 0.0;
+    for (int m = 1; m <= 9; m += 2) {
+        for (int n = 1; n <= 9; n += 2) {
+            double Amn = 64.0 / (std::pow(PI * m * n, 3));
+            sum += Amn
+                 * std::sin(m * PI * x)
+                 * std::sin(n * PI * y)
+                 * std::exp(-alpha * PI * PI * (m*m + n*n) * t);
+        }
+    }
+    return sum;
+}
+
+void printGrid(const std::vector<std::vector<double>>& grid, const std::string& title) {
+    int rowsToPrint = std::min(5, static_cast<int>(grid.size()));
+    std::cout << "\n" << title << " (тек алғашқы " << rowsToPrint << " жол):\n\n";
+    for (int i = 0; i < rowsToPrint; ++i) {
+        for (int j = 0; j < std::min(5, static_cast<int>(grid[i].size())); ++j) {
+            std::cout << std::setw(10)
+                      << std::fixed << std::setprecision(5)
+                      << grid[i][j];
+        }
+        std::cout << "\n";
+    }
+}
+
+int main(int argc, char* argv[]) {
+    MPI_Init(&argc, &argv);
+
+    int rank, size;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+
+    if (Nx % size != 0) {
+        if (rank == 0) {
+            std::cerr << "Error: Nx must be divisible by number of processes\n";
+        }
+        MPI_Finalize();
+        return 1;
+    }
+
+    int local_Nx = Nx / size;
+    int startX = rank * local_Nx + 1;
+    int endX   = (rank == size - 1) ? Nx - 1 : (rank + 1) * local_Nx;
+
+    std::vector<std::vector<double>> U    (local_Nx + 2, std::vector<double>(Ny + 1, 0.0));
+    std::vector<std::vector<double>> U_new(local_Nx + 2, std::vector<double>(Ny + 1, 0.0));
+
+    for (int i = 1; i <= local_Nx; ++i) {
+        double x = (startX + i - 1) * h;
+        for (int j = 0; j <= Ny; ++j) {
+            U[i][j] = initialCondition(x, j * h);
+        }
+    }
+
+    double coeff = alpha * dt / (h * h);
+
+    if (rank == 0) MPI_Barrier(MPI_COMM_WORLD);
+    double t0 = 0.0;
+    if (rank == 0) {
+        t0 = MPI_Wtime();
+    }
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    for (int t = 0; t < Nt; ++t) {
+        if (rank > 0) {
+            MPI_Sendrecv(
+                U[1].data(), Ny + 1, MPI_DOUBLE, rank - 1, 0,
+                U[0].data(), Ny + 1, MPI_DOUBLE, rank - 1, 0,
+                MPI_COMM_WORLD, MPI_STATUS_IGNORE
+            );
+        }
+        if (rank < size - 1) {
+            MPI_Sendrecv(
+                U[local_Nx].data(),     Ny + 1, MPI_DOUBLE, rank + 1, 0,
+                U[local_Nx + 1].data(), Ny + 1, MPI_DOUBLE, rank + 1, 0,
+                MPI_COMM_WORLD, MPI_STATUS_IGNORE
+            );
+        }
+
+        for (int i = 1; i <= local_Nx; ++i) {
+            for (int j = 1; j < Ny; ++j) {
+                U_new[i][j] = U[i][j] + coeff * (
+                    U[i+1][j] + U[i-1][j] +
+                    U[i][j+1] + U[i][j-1] - 4.0 * U[i][j]
+                );
+            }
+        }
+        std::swap(U, U_new);
+    }
+
+    MPI_Barrier(MPI_COMM_WORLD);
+    double t1 = 0.0;
+    if (rank == 0) {
+        t1 = MPI_Wtime();
+        double wallClockTime = t1 - t0;
+        std::cout << "Computation time with " << size
+                  << " processors: " << wallClockTime << " seconds\n";
+    }
+
+    std::vector<std::vector<double>> fullU;
+    if (rank == 0) {
+        fullU.assign(Nx + 1, std::vector<double>(Ny + 1, 0.0));
+        for (int i = 1; i <= local_Nx; ++i) {
+            std::copy(
+                U[i].begin(), U[i].end(),
+                fullU[startX + i - 1].begin()
+            );
+        }
+        for (int p = 1; p < size; ++p) {
+            int sx = p * local_Nx + 1;
+            int ex = (p == size - 1 ? Nx - 1 : (p + 1) * local_Nx);
+            for (int i = sx; i <= ex; ++i) {
+                MPI_Recv(
+                    fullU[i].data(),
+                    Ny + 1,
+                    MPI_DOUBLE,
+                    p, 0,
+                    MPI_COMM_WORLD,
+                    MPI_STATUS_IGNORE
+                );
+            }
+        }
+
+        std::vector<std::vector<double>> analytical(Nx + 1, std::vector<double>(Ny + 1));
+        std::vector<std::vector<double>> error     (Nx + 1, std::vector<double>(Ny + 1));
+        for (int i = 0; i <= Nx; ++i) {
+            double x = i * h;
+            for (int j = 0; j <= Ny; ++j) {
+                double y = j * h;
+                analytical[i][j] = analyticalSolution(x, y, T);
+                error    [i][j] = std::fabs(fullU[i][j] - analytical[i][j]);
+            }
+        }
+
+        printGrid(fullU,      "Numerical Solution");
+        printGrid(analytical, "Analytical Solution");
+        printGrid(error,      "Error");
+    } else {
+        for (int i = 1; i <= local_Nx; ++i) {
+            MPI_Send(
+                U[i].data(),
+                Ny + 1,
+                MPI_DOUBLE,
+                0, 0,
+                MPI_COMM_WORLD
+            );
+        }
+    }
+
+    MPI_Finalize();
+    return 0;
+}
